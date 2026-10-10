@@ -224,6 +224,7 @@ class DataLimitResetStrategy(str, Enum):
 class User(Base, CreatedAtUTCMixin):
     __tablename__ = "users"
     __table_args__ = (
+        Index("idx_users_created_at_id", "created_at", "id"),
         Index("idx_users_admin_online", "admin_id", "online_at"),
         Index("idx_users_admin_status", "admin_id", "status"),
         Index("idx_users_admin_created", "admin_id", "created_at"),
@@ -269,6 +270,7 @@ class User(Base, CreatedAtUTCMixin):
     edit_at: Mapped[dt | None] = mapped_column(DateTime(timezone=True), default=None)
     last_status_change: Mapped[dt | None] = mapped_column(DateTime(timezone=True), default=None)
     _reseted_usage_query: Mapped[int | None] = query_expression(repr=False)
+    hwid_count: Mapped[int | None] = query_expression(repr=False)
 
     @hybrid_property
     def expire(self) -> dt | None:
@@ -444,6 +446,7 @@ class UserSubscriptionUpdate(Base, CreatedAtUTCMixin):
     __table_args__ = (
         Index("idx_user_subscription_updates_user_id", "user_id"),
         Index("idx_user_subscription_updates_user_created", "user_id", "created_at"),
+        Index("idx_user_subscription_updates_created_at", "created_at"),
     )
     user_id: Mapped[int] = fk_id_column("users.id", ondelete="CASCADE")
     user: Mapped[User] = relationship(back_populates="subscription_updates", init=False)

@@ -8,6 +8,7 @@ from sqlalchemy import and_, bindparam, case, delete, desc, func, literal, not_,
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, load_only, selectinload, with_expression
 from sqlalchemy.sql import Select
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.functions import coalesce
 
 from app.db.compiles_types import DateDiff
@@ -22,7 +23,9 @@ from app.db.models import (
     ProxyInbound,
     ReminderType,
     User,
+    UserHWID,
     UserStatus,
+    UserStatusCreate,
     UserSubscriptionUpdate,
     UserUsageResetLogs,
     inbounds_groups_association,
@@ -368,6 +371,10 @@ async def get_users_with_proxy_settings(
     return list(result.scalars().all())
 
 
+def _user_hwid_count_subquery():
+    return select(func.count(UserHWID.id)).where(UserHWID.user_id == User.id).correlate(User).scalar_subquery()
+
+
 async def get_admin_users_for_node_sync(
     db: AsyncSession,
     admin_id: int,
@@ -390,6 +397,10 @@ async def get_admin_users_for_node_sync(
 
 
 def _build_user_sort_clause(sort_option: UserSortOption):
+    if sort_option.field == UserSortField.hwid_count:
+        count = _user_hwid_count_subquery()
+        return count.desc() if sort_option.value.startswith("-") else count.asc()
+
     field_map = {
         UserSortField.username: User.username,
         UserSortField.used_traffic: User.used_traffic,
@@ -422,6 +433,30 @@ def _build_user_simple_sort_clause(sort_option: UserSimpleSortOption):
     return column.desc() if sort_option.value.startswith("-") else column.asc()
 
 
+def _build_user_sort_clauses(sort_options: list[UserSortOption]) -> list[ColumnElement]:
+    clauses = []
+    for sort_option in sort_options:
+        clause = _build_user_sort_clause(sort_option)
+        if isinstance(clause, tuple):
+            clauses.extend(clause)
+        else:
+            clauses.append(clause)
+
+    if sort_options:
+        # Keep offset pagination deterministic when multiple users share the
+        # same value for the requested sort field. Matching the last direction
+        # also lets the default created_at sort use (created_at, id) directly.
+        last_sort_descending = sort_options[-1].value.startswith("-")
+        clauses.append(User.id.desc() if last_sort_descending else User.id.asc())
+
+    return clauses
+
+
+def _build_user_count_stmt(stmt: Select) -> Select:
+    """Count filtered users without carrying page ordering or wide user rows."""
+    return stmt.with_only_columns(func.count(User.id)).order_by(None)
+
+
 async def get_users(
     db: AsyncSession,
     query: UserListQuery,
@@ -431,6 +466,7 @@ async def get_users(
     load_usage_logs: bool = True,
     load_lifetime_used_traffic: bool = False,
     load_group_inbounds: bool = False,
+    load_hwid_count: bool = False,
 ) -> list[User] | tuple[list[User], int]:
     """
     Retrieves users based on various filters.
@@ -466,6 +502,8 @@ async def get_users(
     if load_lifetime_used_traffic:
         options.append(with_expression(User._reseted_usage_query, _user_reset_traffic_subquery()))
     stmt = select(User).options(*options)
+    if load_hwid_count:
+        stmt = stmt.options(with_expression(User.hwid_count, _user_hwid_count_subquery()))
 
     filters = []
     if query.ids:
@@ -531,18 +569,11 @@ async def get_users(
         stmt = stmt.where(and_(*filters))
 
     if query.sort:
-        sort_clauses = []
-        for sort_option in query.sort:
-            clause = _build_user_sort_clause(sort_option)
-            if isinstance(clause, tuple):
-                sort_clauses.extend(clause)
-            else:
-                sort_clauses.append(clause)
-        stmt = stmt.order_by(*sort_clauses)
+        stmt = stmt.order_by(*_build_user_sort_clauses(query.sort))
 
     total = None
     if return_with_count:
-        count_stmt = select(func.count()).select_from(stmt.subquery())
+        count_stmt = _build_user_count_stmt(stmt)
         result = await db.execute(count_stmt)
         total = result.scalar()
 
@@ -1350,14 +1381,17 @@ async def reset_user_by_next(db: AsyncSession, db_user: User, *, clean_chart_dat
     Returns:
         User: The updated user object.
     """
+    now = datetime.now(UTC)
+    db_user.status = UserStatus.active
+    db_user.on_hold_expire_duration = None
+    db_user.on_hold_timeout = None
+    db_user.edit_at = now
     remaining_traffic = (db_user.data_limit or 0) - db_user.used_traffic
     if db_user.next_plan.user_template_id is None:
         db_user.data_limit = db_user.next_plan.data_limit + (
             0 if not db_user.next_plan.add_remaining_traffic else remaining_traffic
         )
-        db_user.expire = (
-            timedelta(seconds=db_user.next_plan.expire) + datetime.now(UTC) if db_user.next_plan.expire else None
-        )
+        db_user.expire = now + timedelta(seconds=db_user.next_plan.expire) if db_user.next_plan.expire else None
     else:
         await db_user.next_plan.awaitable_attrs.user_template
         await db_user.next_plan.user_template.awaitable_attrs.groups
@@ -1366,14 +1400,20 @@ async def reset_user_by_next(db: AsyncSession, db_user: User, *, clean_chart_dat
         db_user.data_limit = db_user.next_plan.user_template.data_limit + (
             0 if not db_user.next_plan.add_remaining_traffic else remaining_traffic
         )
-        if db_user.next_plan.user_template.status is UserStatus.on_hold:
+        if db_user.next_plan.user_template.status is UserStatusCreate.on_hold:
             db_user.status = UserStatus.on_hold
             db_user.on_hold_expire_duration = db_user.next_plan.user_template.expire_duration
-            db_user.on_hold_timeout = db_user.next_plan.user_template.on_hold_timeout
+            db_user.on_hold_timeout = (
+                now + timedelta(seconds=db_user.next_plan.user_template.on_hold_timeout)
+                if db_user.next_plan.user_template.on_hold_timeout
+                else None
+            )
+            # Only connections after renewal may start this plan.
+            db_user.online_at = None
             db_user.expire = None
         else:
             db_user.expire = (
-                timedelta(seconds=db_user.next_plan.user_template.expire_duration) + datetime.now(UTC)
+                now + timedelta(seconds=db_user.next_plan.user_template.expire_duration)
                 if db_user.next_plan.user_template.expire_duration
                 else None
             )
@@ -1392,8 +1432,6 @@ async def reset_user_by_next(db: AsyncSession, db_user: User, *, clean_chart_dat
     await delete_user_passed_notification_reminders(db, db_user.id, ReminderType.data_usage, 0)
     if clean_chart_data:
         await clear_user_node_usages(db, db_user.id)
-    db_user.status = UserStatus.active
-
     await db.commit()
     await refresh_and_load_user(db, db_user)
     return db_user
@@ -1505,10 +1543,13 @@ def _subscription_update_from_clause(
     if user_id is not None:
         conditions.append(UserSubscriptionUpdate.user_id == user_id)
         from_clause = UserSubscriptionUpdate.__table__
-    else:
+    elif admin_id is not None:
         from_clause = UserSubscriptionUpdate.__table__.join(User, UserSubscriptionUpdate.user_id == User.id)
-        if admin_id:
-            conditions.append(User.admin_id == admin_id)
+        conditions.append(User.admin_id == admin_id)
+    else:
+        # The owner-wide chart does not read any users columns. Keeping this
+        # history-only lets the created_at index drive the global time range.
+        from_clause = UserSubscriptionUpdate.__table__
     return from_clause, conditions
 
 
@@ -1754,7 +1795,7 @@ async def get_user_count_metric_stats(
     """Retrieves one distinct user count metric from node_user_usages."""
     validate_user_count_metric_scope(metric, node_id=node_id, group_by_node=group_by_node)
 
-    query_parts = _build_user_count_query_parts(db, admins, start, end, period, node_id)
+    query_parts = _build_user_count_query_parts(db, admins, start, end, period, metric, node_id)
     count_expr = _build_user_count_metric_expression(metric).label("count")
     total_stmt = select(count_expr).select_from(query_parts["from_clause"]).where(and_(*query_parts["conditions"]))
 
@@ -1810,6 +1851,7 @@ def _build_user_count_query_parts(
     start: datetime,
     end: datetime,
     period: Period,
+    metric: UserCountMetric,
     node_id: int | None,
 ) -> dict:
     admins_filter = admins or None
@@ -1830,7 +1872,11 @@ def _build_user_count_query_parts(
     else:
         stats_key = -1
 
-    from_clause = NodeUserUsage.__table__.join(User, User.id == NodeUserUsage.user_id)
+    # Online counts only read node_user_usages. Avoid joining every history row
+    # to users unless a status metric or an admin scope actually needs it.
+    from_clause = NodeUserUsage.__table__
+    if metric != UserCountMetric.online or admins_filter:
+        from_clause = from_clause.join(User, User.id == NodeUserUsage.user_id)
     if admins_filter:
         from_clause = from_clause.join(Admin, Admin.id == User.admin_id)
 

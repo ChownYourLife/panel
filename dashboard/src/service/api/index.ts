@@ -2401,6 +2401,33 @@ export interface UserIPListAll {
   nodes: UserIPListAllNodes;
 }
 
+export interface UserListItem {
+  proxy_settings?: ProxyTable;
+  expire?: string | number | null;
+  /** data_limit can be 0 or greater */
+  data_limit?: number | null;
+  data_limit_reset_strategy?: DataLimitResetStrategy | null;
+  note?: string | null;
+  /** on_hold_expire_duration can be 0 or greater in seconds */
+  on_hold_expire_duration?: number | null;
+  on_hold_timeout?: string | number | null;
+  group_ids?: number[] | null;
+  auto_delete_in_days?: number | null;
+  hwid_limit?: number | null;
+  next_plan?: NextPlanModel | null;
+  id: number;
+  username: string;
+  status: UserStatus;
+  used_traffic: number;
+  lifetime_used_traffic?: number;
+  created_at: string;
+  edit_at?: string | null;
+  online_at?: string | null;
+  subscription_url?: string;
+  admin?: AdminBase | null;
+  hwid_count?: number | null;
+}
+
 export interface UserModify {
   proxy_settings?: ProxyTable | null;
   expire?: string | number | null;
@@ -2583,7 +2610,7 @@ export interface UserUsageStatsList {
 }
 
 export interface UsersResponse {
-  users: UserResponse[];
+  users: UserListItem[];
   total: number;
 }
 

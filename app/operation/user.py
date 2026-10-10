@@ -40,7 +40,6 @@ from app.db.crud.user import (
     get_users_count_by_admin,
     get_users_simple,
     get_users_sub_update_list,
-    get_users_subscription_agent_counts,
     get_users_subscription_agent_stats,
     load_user_attrs,
     lock_admin_quota_row,
@@ -86,6 +85,7 @@ from app.models.user import (
     UserResponse,
     UserSimple,
     UserSimpleListQuery,
+    UserSortField,
     UsersResponse,
     UsersSimpleResponse,
     UserStatusToggle,
@@ -1466,12 +1466,21 @@ class UserOperation(BaseOperation):
         if scope_admin_id is not None:
             query = query.model_copy(update={"owner": [admin.username], "admin_ids": None})
 
+        # Device counts are HWID data: without hwids.read they are not loaded and the sort is
+        # ignored, the same way node filters are ignored without nodes.stats.
+        can_read_hwids = _has_permission(admin, "hwids", "read")
+        if not can_read_hwids and any(option.field == UserSortField.hwid_count for option in query.sort):
+            query = query.model_copy(
+                update={"sort": [option for option in query.sort if option.field != UserSortField.hwid_count]}
+            )
+
         users, count = await get_users(
             db=db,
             query=query,
             return_with_count=True,
             load_usage_logs=False,
             load_lifetime_used_traffic=True,
+            load_hwid_count=can_read_hwids,
         )
 
         if query.load_sub:
@@ -2046,14 +2055,6 @@ class UserOperation(BaseOperation):
             else:
                 resolved_admin_id = get_scope_admin_id(admin, "users", "read")
 
-        agent_counts = await get_users_subscription_agent_counts(
-            db,
-            user_id=resolved_user_id,
-            admin_id=resolved_admin_id,
-            start=start,
-            end=end,
-            period=period,
-        )
         agent_stats = await get_users_subscription_agent_stats(
             db,
             start=start,
@@ -2062,8 +2063,15 @@ class UserOperation(BaseOperation):
             user_id=resolved_user_id,
             admin_id=resolved_admin_id,
         )
+        # The period rows already contain every update in the requested range,
+        # so derive pie totals from them instead of scanning the same history a
+        # second time solely for totals.
+        agent_totals: Counter[str] = Counter()
+        for row in agent_stats:
+            agent_totals[row.get("agent") or ""] += int(row.get("count") or 0)
+
         return self._build_user_agent_chart(
-            agent_counts,
+            list(agent_totals.items()),
             start=start,
             end=end,
             agent_stats=agent_stats,
